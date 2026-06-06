@@ -17,8 +17,10 @@ def stock_list_embed(stocks: list[dict], prices: dict) -> discord.Embed:
         change = price - prev
         pct = (change / prev * 100) if prev else 0
         arrow = "🔺" if change > 0 else ("🔻" if change < 0 else "➡️")
+        limit_up = info.get("limit_up", 0)
+        limit_tag = " 🔒漲停" if limit_up > 0 and price >= limit_up else ""
         embed.add_field(
-            name=f"{arrow} {name} ({code})",
+            name=f"{arrow} {name} ({code}){limit_tag}",
             value=f"現價：**{price:.2f}**　漲跌：{change:+.2f} ({pct:+.2f}%)",
             inline=False,
         )
@@ -31,7 +33,11 @@ def stock_status_embed(code: str, info: dict) -> discord.Embed:
     prev = info.get("prev_close", price)
     change = price - prev
     pct = (change / prev * 100) if prev else 0
-    limit_up, limit_down = calc_limit_prices(prev)
+
+    # Use API-provided limit prices; fall back to calculation
+    limit_up = info.get("limit_up") or calc_limit_prices(prev)[0]
+    limit_down = info.get("limit_down") or calc_limit_prices(prev)[1]
+
     rsi = get_rsi(code)
     ma5 = get_ma5(code)
 
@@ -68,4 +74,84 @@ def daily_report_embed(title: str, stocks: list[dict], prices: dict) -> discord.
             value=f"{price:.2f}　{change:+.2f} ({pct:+.2f}%)",
             inline=False,
         )
+    return embed
+
+
+def recommend_embed(
+    code: str,
+    info: dict,
+    rsi: float | None,
+    ma5: float | None,
+    ma20: float | None,
+    high20: float | None,
+    low20: float | None,
+) -> discord.Embed:
+    name = info.get("name", code)
+    price = info.get("close", 0)
+
+    signals = []
+    if rsi is not None:
+        if rsi < 30:
+            signals.append(f"RSI {rsi:.1f} — 超賣區，具反彈機會")
+        elif rsi < 50:
+            signals.append(f"RSI {rsi:.1f} — 偏弱")
+        elif rsi < 70:
+            signals.append(f"RSI {rsi:.1f} — 中性偏強")
+        else:
+            signals.append(f"RSI {rsi:.1f} — 超買，注意獲利了結風險")
+
+    if ma5 is not None and ma20 is not None and price > 0:
+        if price > ma5 > ma20:
+            signals.append("現價 > 5MA > 20MA，多頭排列強勢")
+        elif price < ma5 < ma20:
+            signals.append("現價 < 5MA < 20MA，空頭排列弱勢")
+        elif price > ma5 and ma5 < ma20:
+            signals.append("短線反彈，但 20MA 仍是壓力")
+        elif price < ma5 and ma5 > ma20:
+            signals.append("跌破 5MA，短線轉弱")
+
+    # Suggested target and stop-loss
+    target_price = None
+    stop_price = None
+
+    if high20 and high20 > price * 1.01:
+        target_price = high20
+    elif price > 0:
+        target_price = round(price * 1.08, 2)
+
+    if ma20 and ma20 < price * 0.99:
+        stop_price = round(ma20 * 0.99, 2)
+    elif low20 and low20 < price:
+        stop_price = low20
+    elif price > 0:
+        stop_price = round(price * 0.95, 2)
+
+    embed = discord.Embed(title=f"🔍 技術分析：{name} ({code})", color=0x00bfff)
+    embed.add_field(name="現價", value=f"**{price:.2f}**", inline=True)
+    if rsi is not None:
+        embed.add_field(name="RSI(14)", value=f"{rsi:.1f}", inline=True)
+    if ma5 is not None:
+        embed.add_field(name="5MA", value=f"{ma5:.2f}", inline=True)
+    if ma20 is not None:
+        embed.add_field(name="20MA", value=f"{ma20:.2f}", inline=True)
+    if high20 is not None:
+        embed.add_field(name="20日最高", value=f"{high20:.2f}", inline=True)
+    if low20 is not None:
+        embed.add_field(name="20日最低", value=f"{low20:.2f}", inline=True)
+
+    if signals:
+        embed.add_field(name="📊 技術訊號", value="\n".join(f"• {s}" for s in signals), inline=False)
+
+    suggestion_parts = []
+    if target_price:
+        pct = (target_price - price) / price * 100
+        suggestion_parts.append(f"🎯 目標價：**{target_price:.2f}**（{pct:+.1f}%）")
+    if stop_price:
+        pct = (stop_price - price) / price * 100
+        suggestion_parts.append(f"🛡️ 建議停損：**{stop_price:.2f}**（{pct:+.1f}%）")
+
+    if suggestion_parts:
+        embed.add_field(name="建議價位", value="\n".join(suggestion_parts), inline=False)
+
+    embed.set_footer(text="⚠️ 僅供參考，非投資建議，請自行評估風險。")
     return embed

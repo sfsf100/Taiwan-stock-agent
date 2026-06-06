@@ -7,10 +7,15 @@ from dotenv import load_dotenv
 from datetime import datetime, time as dtime
 
 from src import database as db
-from src.twse_api import get_stock_info, validate_stock, get_realtime_price, is_trading_time
+from src.twse_api import (
+    get_stock_info, validate_stock, get_realtime_price,
+    is_trading_time, fetch_watchlist_prices,
+)
 from src.alert_engine import check_alerts, check_technical_alerts
-from src.formatters import stock_list_embed, stock_status_embed, daily_report_embed
-from src.indicators import preload
+from src.formatters import (
+    stock_list_embed, stock_status_embed, daily_report_embed, recommend_embed,
+)
+from src.indicators import preload, get_rsi, get_ma5, get_ma20, get_recent_high_low
 
 load_dotenv()
 
@@ -33,21 +38,25 @@ async def price_monitor():
         return
 
     watchlist = db.get_watchlist()
+    if not watchlist:
+        return
+
+    # Batch-fetch all prices in a single API call
+    codes_exchanges = [(s["stock_code"], s.get("exchange", "tse")) for s in watchlist]
+    loop = asyncio.get_running_loop()
+    prices = await loop.run_in_executor(None, fetch_watchlist_prices, codes_exchanges)
+
     for s in watchlist:
         code = s["stock_code"]
         name = s["stock_name"]
-        info = get_stock_info(code)
+        info = prices.get(code)
         if not info:
             continue
-        price = info["close"]
-        prev = info["prev_close"]
 
-        alerts = check_alerts(code, name, price, prev)
-        for alert in alerts:
+        for alert in check_alerts(code, name, info):
             await channel.send(alert["message"], allowed_mentions=discord.AllowedMentions(everyone=True))
 
-        tech_alerts = check_technical_alerts(code, name)
-        for alert in tech_alerts:
+        for alert in check_technical_alerts(code, name):
             await channel.send(alert["message"], allowed_mentions=discord.AllowedMentions(everyone=True))
 
 
@@ -58,11 +67,9 @@ async def send_daily_report(title: str):
     watchlist = db.get_watchlist()
     if not watchlist:
         return
-    prices = {}
-    for s in watchlist:
-        info = get_stock_info(s["stock_code"])
-        if info:
-            prices[s["stock_code"]] = info
+    codes_exchanges = [(s["stock_code"], s.get("exchange", "tse")) for s in watchlist]
+    loop = asyncio.get_running_loop()
+    prices = await loop.run_in_executor(None, fetch_watchlist_prices, codes_exchanges)
     embed = daily_report_embed(title, watchlist, prices)
     await channel.send(embed=embed)
 
@@ -105,7 +112,10 @@ async def on_ready():
         print(f"Bot 已啟動：{client.user}，監控 {len(watchlist)} 檔股票")
         channel = client.get_channel(CHANNEL_ID)
         if channel:
-            await channel.send(f"@everyone ✅ 台股監控 Bot 已上線！監控中：{len(watchlist)} 檔股票", allowed_mentions=discord.AllowedMentions(everyone=True))
+            await channel.send(
+                f"@everyone ✅ 台股監控 Bot 已上線！監控中：{len(watchlist)} 檔股票",
+                allowed_mentions=discord.AllowedMentions(everyone=True),
+            )
     except Exception as e:
         import traceback
         print(f"on_ready 錯誤：{e}\n{traceback.format_exc()}")
@@ -123,15 +133,16 @@ async def ping(interaction: discord.Interaction):
 async def watch(interaction: discord.Interaction, codes: str):
     await interaction.response.defer()
     results = []
+    loop = asyncio.get_running_loop()
     for code in codes.split():
         code = code.strip()
         if db.is_watching(code):
             results.append(f"ℹ️ {code} 已在監控清單")
             continue
-        name = await asyncio.get_running_loop().run_in_executor(None, validate_stock, code)
+        name, exchange = await loop.run_in_executor(None, validate_stock, code)
         if name:
-            db.add_stock(code, name)
-            results.append(f"✅ 已新增：{name} ({code})")
+            db.add_stock(code, name, exchange)
+            results.append(f"✅ 已新增：{name} ({code})  [{exchange.upper()}]")
         else:
             results.append(f"❌ 找不到代碼：{code}")
     await interaction.followup.send("\n".join(results))
@@ -153,11 +164,9 @@ async def unwatch(interaction: discord.Interaction, code: str):
 async def list_stocks(interaction: discord.Interaction):
     await interaction.response.defer()
     watchlist = db.get_watchlist()
-    prices = {}
-    for s in watchlist:
-        info = get_stock_info(s["stock_code"])
-        if info:
-            prices[s["stock_code"]] = info
+    codes_exchanges = [(s["stock_code"], s.get("exchange", "tse")) for s in watchlist]
+    loop = asyncio.get_running_loop()
+    prices = await loop.run_in_executor(None, fetch_watchlist_prices, codes_exchanges)
     embed = stock_list_embed(watchlist, prices)
     await interaction.followup.send(embed=embed)
 
@@ -166,7 +175,8 @@ async def list_stocks(interaction: discord.Interaction):
 @app_commands.describe(code="股票代碼，例如 2330")
 async def status(interaction: discord.Interaction, code: str):
     await interaction.response.defer()
-    info = get_stock_info(code)
+    loop = asyncio.get_running_loop()
+    info = await loop.run_in_executor(None, get_stock_info, code)
     if not info:
         await interaction.followup.send(f"❌ 查無股票代碼：{code}")
         return
@@ -174,20 +184,55 @@ async def status(interaction: discord.Interaction, code: str):
     await interaction.followup.send(embed=embed)
 
 
-@tree.command(name="target", description="設定目標價警報")
+@tree.command(name="target", description="設定目標價警報（漲至此價位時通知）")
 @app_commands.describe(code="股票代碼", price="目標價格")
 async def target(interaction: discord.Interaction, code: str, price: float):
-    info = get_stock_info(code)
+    loop = asyncio.get_running_loop()
+    info = await loop.run_in_executor(None, get_stock_info, code)
     name = info["name"] if info else code
     db.add_target(code, price)
-    await interaction.response.send_message(f"✅ 已設定 **{name} ({code})** 目標價：**{price:.2f}** 元")
+    await interaction.response.send_message(
+        f"🎯 已設定 **{name} ({code})** 目標價：**{price:.2f}** 元"
+    )
+
+
+@tree.command(name="stoploss", description="設定停損價警報（跌至此價位時通知）")
+@app_commands.describe(code="股票代碼", price="停損價格")
+async def stoploss(interaction: discord.Interaction, code: str, price: float):
+    loop = asyncio.get_running_loop()
+    info = await loop.run_in_executor(None, get_stock_info, code)
+    name = info["name"] if info else code
+    db.add_stop_target(code, price)
+    await interaction.response.send_message(
+        f"🛡️ 已設定 **{name} ({code})** 停損價：**{price:.2f}** 元\n（跌破時將發出 @everyone 警告）"
+    )
+
+
+@tree.command(name="recommend", description="技術面分析與建議目標／停損價位")
+@app_commands.describe(code="股票代碼，例如 2330")
+async def recommend(interaction: discord.Interaction, code: str):
+    await interaction.response.defer()
+    loop = asyncio.get_running_loop()
+    info = await loop.run_in_executor(None, get_stock_info, code)
+    if not info:
+        await interaction.followup.send(f"❌ 查無股票代碼：{code}")
+        return
+
+    rsi = await loop.run_in_executor(None, get_rsi, code)
+    ma5 = await loop.run_in_executor(None, get_ma5, code)
+    ma20 = await loop.run_in_executor(None, get_ma20, code)
+    high20, low20 = await loop.run_in_executor(None, get_recent_high_low, code)
+
+    embed = recommend_embed(code, info, rsi, ma5, ma20, high20, low20)
+    await interaction.followup.send(embed=embed)
 
 
 @tree.command(name="price", description="快速查詢台股現價")
 @app_commands.describe(code="股票代碼，例如 2330")
 async def price_cmd(interaction: discord.Interaction, code: str):
     await interaction.response.defer()
-    p = await asyncio.get_running_loop().run_in_executor(None, get_realtime_price, code)
+    loop = asyncio.get_running_loop()
+    p = await loop.run_in_executor(None, get_realtime_price, code)
     if p:
         await interaction.followup.send(f"📈 **{code}** 現價：**{p:.2f}**")
     else:

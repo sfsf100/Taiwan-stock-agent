@@ -22,8 +22,7 @@ def get_rsi(code: str, period: int = 14) -> float | None:
     delta = df["Close"].diff()
     gain = delta.clip(lower=0).rolling(period).mean()
     loss = (-delta.clip(upper=0)).rolling(period).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
+    rsi = 100 - (100 / (1 + gain / loss))
     val = rsi.iloc[-1]
     return round(float(val), 2) if not pd.isna(val) else None
 
@@ -33,6 +32,14 @@ def get_ma5(code: str) -> float | None:
     if df.empty or len(df) < 5:
         return None
     val = df["Close"].rolling(5).mean().iloc[-1]
+    return round(float(val), 2) if not pd.isna(val) else None
+
+
+def get_ma20(code: str) -> float | None:
+    df = fetch_history(code)
+    if df.empty or len(df) < 20:
+        return None
+    val = df["Close"].rolling(20).mean().iloc[-1]
     return round(float(val), 2) if not pd.isna(val) else None
 
 
@@ -46,6 +53,14 @@ def get_volume_ratio(code: str) -> float | None:
     if avg_vol == 0:
         return None
     return round(float(today_vol / avg_vol), 2)
+
+
+def get_recent_high_low(code: str, days: int = 20) -> tuple[float, float] | tuple[None, None]:
+    df = fetch_history(code)
+    if df.empty or len(df) < days:
+        return None, None
+    recent = df["Close"].iloc[-days:]
+    return round(float(recent.max()), 2), round(float(recent.min()), 2)
 
 
 def preload(codes: list[str]):
