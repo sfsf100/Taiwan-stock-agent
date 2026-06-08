@@ -39,6 +39,13 @@ def init_db():
                 alert_type TEXT NOT NULL,
                 triggered_date TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS holdings (
+                stock_code TEXT PRIMARY KEY,
+                stock_name TEXT NOT NULL,
+                shares INTEGER NOT NULL,
+                cost_price REAL NOT NULL,
+                added_at TEXT NOT NULL
+            );
         """)
     # Migrate: add exchange column to existing DBs
     with get_conn() as conn:
@@ -114,6 +121,33 @@ def remove_stop_target(code: str, price: float):
 def get_stop_targets() -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute("SELECT * FROM stop_targets").fetchall()
+        return [dict(r) for r in rows]
+
+
+# --- Holdings ---
+
+def add_holding(code: str, name: str, shares: int, cost_price: float):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO holdings (stock_code, stock_name, shares, cost_price, added_at) VALUES (?, ?, ?, ?, date('now'))",
+            (code, name, shares, cost_price)
+        )
+
+
+def remove_holding(code: str):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM holdings WHERE stock_code = ?", (code,))
+
+
+def get_holding(code: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM holdings WHERE stock_code = ?", (code,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_holdings() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM holdings ORDER BY added_at").fetchall()
         return [dict(r) for r in rows]
 
 

@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from datetime import datetime, time as dtime
 
 from src import database as db
+from src.formatters import holdings_embed
 from src.twse_api import (
     get_stock_info, validate_stock, get_realtime_price,
     is_trading_time, fetch_watchlist_prices,
@@ -14,6 +15,7 @@ from src.twse_api import (
 from src.alert_engine import check_alerts, check_technical_alerts
 from src.formatters import (
     stock_list_embed, stock_status_embed, daily_report_embed, recommend_embed,
+    holdings_embed,
 )
 from src.indicators import preload, get_rsi, get_ma5, get_ma20, get_recent_high_low
 
@@ -142,7 +144,9 @@ async def watch(interaction: discord.Interaction, codes: str):
         name, exchange = await loop.run_in_executor(None, validate_stock, code)
         if name:
             db.add_stock(code, name, exchange)
-            results.append(f"✅ 已新增：{name} ({code})  [{exchange.upper()}]")
+            holding = db.get_holding(code)
+            holding_tag = f"　💼 持有中 {holding['shares']} 股，成本 {holding['cost_price']:.2f}" if holding else ""
+            results.append(f"✅ 已新增：{name} ({code})  [{exchange.upper()}]{holding_tag}")
         else:
             results.append(f"❌ 找不到代碼：{code}")
     await interaction.followup.send("\n".join(results))
@@ -237,6 +241,60 @@ async def price_cmd(interaction: discord.Interaction, code: str):
         await interaction.followup.send(f"📈 **{code}** 現價：**{p:.2f}**")
     else:
         await interaction.followup.send(f"❌ 查無股票代碼：{code}")
+
+
+@tree.command(name="hold", description="記錄持有股票（永久儲存）")
+@app_commands.describe(code="股票代碼", shares="持有股數", cost="平均成本價")
+async def hold(interaction: discord.Interaction, code: str, shares: int, cost: float):
+    await interaction.response.defer()
+    loop = asyncio.get_running_loop()
+    name_from_db = None
+    if db.is_watching(code):
+        wl = db.get_watchlist()
+        name_from_db = next((s["stock_name"] for s in wl if s["stock_code"] == code), None)
+    if not name_from_db:
+        name_from_db, _ = await loop.run_in_executor(None, validate_stock, code)
+    if not name_from_db:
+        await interaction.followup.send(f"❌ 查無股票代碼：{code}")
+        return
+    db.add_holding(code, name_from_db, shares, cost)
+    await interaction.followup.send(
+        f"💼 已記錄持倉：**{name_from_db} ({code})**　{shares} 股　成本 {cost:.2f} 元"
+    )
+
+
+@tree.command(name="unhold", description="刪除持倉紀錄")
+@app_commands.describe(code="股票代碼")
+async def unhold(interaction: discord.Interaction, code: str):
+    holding = db.get_holding(code)
+    if holding:
+        db.remove_holding(code)
+        await interaction.response.send_message(
+            f"✅ 已刪除持倉：**{holding['stock_name']} ({code})**"
+        )
+    else:
+        await interaction.response.send_message(f"ℹ️ {code} 沒有持倉紀錄")
+
+
+@tree.command(name="holdings", description="查看持倉清單與損益")
+async def holdings_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    held = db.get_holdings()
+    if not held:
+        await interaction.followup.send("📂 尚無持倉紀錄，用 `/hold` 新增。")
+        return
+    loop = asyncio.get_running_loop()
+    codes_exchanges = []
+    for h in held:
+        ex = "tse"
+        wl = db.get_watchlist()
+        match = next((s for s in wl if s["stock_code"] == h["stock_code"]), None)
+        if match:
+            ex = match.get("exchange", "tse")
+        codes_exchanges.append((h["stock_code"], ex))
+    prices = await loop.run_in_executor(None, fetch_watchlist_prices, codes_exchanges)
+    embed = holdings_embed(held, prices)
+    await interaction.followup.send(embed=embed)
 
 
 client.run(TOKEN)
