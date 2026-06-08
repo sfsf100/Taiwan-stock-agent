@@ -155,3 +155,36 @@ def recommend_embed(
 
     embed.set_footer(text="⚠️ 僅供參考，非投資建議，請自行評估風險。")
     return embed
+
+
+def holdings_embed(holdings: list[dict], prices: dict) -> discord.Embed:
+    embed = discord.Embed(title="💼 持倉清單", color=0x9b59b6)
+    total_cost = 0.0
+    total_value = 0.0
+    for h in holdings:
+        code = h["stock_code"]
+        name = h["stock_name"]
+        shares = h["shares"]
+        cost = h["cost_price"]
+        info = prices.get(code, {})
+        price = info.get("close", 0)
+        value = price * shares
+        invested = cost * shares
+        pnl = value - invested
+        pct = (pnl / invested * 100) if invested else 0
+        arrow = "🔺" if pnl > 0 else ("🔻" if pnl < 0 else "➡️")
+        price_str = f"{price:.2f}" if price else "—"
+        embed.add_field(
+            name=f"{arrow} {name} ({code})",
+            value=(
+                f"持股：{shares} 股　成本：{cost:.2f}　現價：{price_str}\n"
+                f"損益：**{pnl:+.0f}** 元　({pct:+.1f}%)"
+            ),
+            inline=False,
+        )
+        total_cost += invested
+        total_value += value if price else invested
+    total_pnl = total_value - total_cost
+    total_pct = (total_pnl / total_cost * 100) if total_cost else 0
+    embed.set_footer(text=f"總損益：{total_pnl:+.0f} 元 ({total_pct:+.1f}%)　總市值：{total_value:,.0f} 元")
+    return embed

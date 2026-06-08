@@ -14,6 +14,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Restore database cache
+        uses: actions/cache@v4
+        with:
+          path: data/
+          key: stocks-db-${{ github.run_id }}
+          restore-keys: |
+            stocks-db-
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
