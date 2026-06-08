@@ -148,14 +148,23 @@ def validate_stock(code: str) -> tuple[str | None, str]:
     Returns (name, exchange) if valid, (None, '') if not found.
     Also updates _code_exchange and _day_name_cache.
     """
-    # Try MIS (TSE then OTC) — fastest
+    # Try MIS (TSE then OTC) — check name/code only; don't require current price
+    # (z field is "-" outside trading hours, which would cause _parse_mis_item to reject it)
     for ex in ("tse", "otc"):
         try:
-            result = _query_mis(f"{ex}_{code}.tw")
-            if code in result:
-                name = result[code]["name"]
-                _day_name_cache[code] = name
-                return name, ex
+            r = requests.get(
+                MIS_URL,
+                params={"ex_ch": f"{ex}_{code}.tw", "json": "1", "delay": "0"},
+                headers=_MIS_HEADERS,
+                timeout=8,
+            )
+            r.raise_for_status()
+            for item in r.json().get("msgArray", []):
+                if item.get("c") == code and item.get("n"):
+                    name = item["n"]
+                    _day_name_cache[code] = name
+                    _code_exchange[code] = ex
+                    return name, ex
         except Exception:
             pass
 
