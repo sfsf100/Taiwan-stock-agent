@@ -195,14 +195,15 @@ async def on_ready():
             scheduled_reports.start()
 
         log.info("Bot 已啟動：%s，監控 %d 檔股票", client.user, len(watchlist))
-        # 上線通知只在初次啟動發送，重連（on_ready 可能觸發多次）不重複打擾
+        # 上線通知：不用 @everyone（GitHub Actions 每 6 小時重啟會重複觸發，
+        # 用 @everyone 每天會打擾 4 次）；僅發一則普通訊息供確認存活
         if not getattr(client, "_online_announced", False):
             client._online_announced = True
             channel = await _get_channel()
             if channel:
                 await channel.send(
-                    f"@everyone ✅ 台股監控 Bot 已上線！監控中：{len(watchlist)} 檔股票",
-                    allowed_mentions=discord.AllowedMentions(everyone=True),
+                    f"✅ 台股監控 Bot 已上線（{now_taipei().strftime('%H:%M')}）"
+                    f"— 監控中：{len(watchlist)} 檔股票"
                 )
     except Exception:
         log.exception("on_ready 發生錯誤")
