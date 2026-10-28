@@ -6,7 +6,7 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from src import database as db
 from src.market_time import now_taipei, is_trading_time
@@ -131,6 +131,21 @@ def _report_slot_key(now: datetime) -> str:
     return f"{now.date().isoformat()}@{now.strftime('%H:%M')}"
 
 
+def due_report_slot(now: datetime, slots: list | None = None, window_sec: float = 90) -> int | None:
+    """判斷現在時間是否落在某個報告檔位的容錯視窗內。
+
+    回傳檔位索引（REPORT_SLOTS 的 index），不在任何檔位則回傳 None。
+    以「分鐘數」比較，避開 datetime.time 無法加 timedelta 的限制。
+    """
+    slots = slots if slots is not None else REPORT_SLOTS
+    now_min = now.hour * 60 + now.minute + now.second / 60
+    for i, ((hh, mm), _title) in enumerate(slots):
+        slot_min = hh * 60 + mm
+        if slot_min <= now_min <= slot_min + window_sec / 60:
+            return i
+    return None
+
+
 # ── 定時報告 ─────────────────────────────────────────────
 @tasks.loop(seconds=30)
 async def scheduled_reports():
@@ -144,20 +159,18 @@ async def scheduled_reports():
         _sent_reports.clear()
         _sent_reports_date = now.date().isoformat()
 
-    t = now.time()
-    for (hh, mm), title in REPORT_SLOTS:
-        # 90 秒的容錯視窗；配合檔位去重，不會重複發送
-        start = t.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if start <= t <= start + timedelta(seconds=90):
-            key = _report_slot_key(now.replace(hour=hh, minute=mm))
-            if key in _sent_reports:
-                return
-            _sent_reports.add(key)
-            try:
-                await send_daily_report(title)
-            except Exception:
-                log.exception("定時報告發送失敗：%s", title)
-            return
+    idx = due_report_slot(now)
+    if idx is None:
+        return
+    (hh, mm), title = REPORT_SLOTS[idx]
+    key = _report_slot_key(now.replace(hour=hh, minute=mm))
+    if key in _sent_reports:
+        return
+    _sent_reports.add(key)
+    try:
+        await send_daily_report(title)
+    except Exception:
+        log.exception("定時報告發送失敗：%s", title)
 
 
 @client.event

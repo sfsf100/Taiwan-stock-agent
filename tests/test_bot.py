@@ -362,6 +362,28 @@ class TestDatabase(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────
+# main.py 定時報告檔位判斷
+# ─────────────────────────────────────────────────────────────
+class TestDueReportSlot(unittest.TestCase):
+    def test_open_slot(self):
+        from main import due_report_slot
+        self.assertEqual(due_report_slot(datetime(2026, 10, 28, 9, 5, 30, tzinfo=TZ)), 0)
+
+    def test_midday_slot(self):
+        from main import due_report_slot
+        self.assertEqual(due_report_slot(datetime(2026, 10, 28, 12, 0, 59, tzinfo=TZ)), 1)
+
+    def test_close_slot(self):
+        from main import due_report_slot
+        self.assertEqual(due_report_slot(datetime(2026, 10, 28, 13, 36, 10, tzinfo=TZ)), 2)
+
+    def test_outside_window(self):
+        from main import due_report_slot
+        self.assertIsNone(due_report_slot(datetime(2026, 10, 28, 9, 7, 1, tzinfo=TZ)))
+        self.assertIsNone(due_report_slot(datetime(2026, 10, 28, 15, 0, 0, tzinfo=TZ)))
+
+
+# ─────────────────────────────────────────────────────────────
 # formatters（防呆：資料缺漏時不應噴例外）
 # ─────────────────────────────────────────────────────────────
 class TestFormatters(unittest.TestCase):
