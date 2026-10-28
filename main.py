@@ -1,16 +1,18 @@
 import os
 import asyncio
+import logging
+
 import discord
 from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
-from datetime import datetime, time as dtime
+from datetime import datetime, timedelta
 
 from src import database as db
-from src.formatters import holdings_embed
+from src.market_time import now_taipei, is_trading_time
 from src.twse_api import (
     get_stock_info, validate_stock, get_realtime_price,
-    is_trading_time, fetch_watchlist_prices,
+    fetch_watchlist_prices,
 )
 from src.alert_engine import check_alerts, check_technical_alerts
 from src.formatters import (
@@ -23,11 +25,48 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
-GUILD_ID = 1511001003716116510
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("bot.log", encoding="utf-8"),
+    ],
+)
+log = logging.getLogger("stock-bot")
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
+
+# 定時報告檔位：台北時間（時, 分）→ 標題
+REPORT_SLOTS = [
+    ((9, 5), "🌅 09:05 開盤報告"),
+    ((12, 0), "☀️ 12:00 盤中報告"),
+    ((13, 35), "🌆 13:35 收盤報告"),
+]
+# 記錄今天已發過的報告檔位，避免重複發送
+_sent_reports: set[str] = set()
+_sent_reports_date = None
+
+
+def _report_slot_key(now: datetime) -> str:
+    return f"{now.date().isoformat()}@{now.strftime('%H:%M')}"
+
+
+async def _get_channel() -> discord.abc.Messageable | None:
+    """優先使用快取；快取未就緒時退回 fetch_channel（會發 API 請求）。"""
+    ch = client.get_channel(CHANNEL_ID)
+    if ch:
+        return ch
+    try:
+        ch = await client.fetch_channel(CHANNEL_ID)
+    except (discord.NotFound, discord.HTTPException, ValueError) as e:
+        log.error("找不到頻道 %s：%s", CHANNEL_ID, e)
+        return None
+    return ch
 
 
 # ── 定時輪詢（30 秒）────────────────────────────────────────
@@ -35,35 +74,47 @@ tree = app_commands.CommandTree(client)
 async def price_monitor():
     if not is_trading_time():
         return
-    channel = client.get_channel(CHANNEL_ID)
-    if not channel:
-        return
+    try:
+        channel = await _get_channel()
+        if not channel:
+            return
 
-    watchlist = db.get_watchlist()
-    if not watchlist:
-        return
+        watchlist = db.get_watchlist()
+        if not watchlist:
+            return
 
-    # Batch-fetch all prices in a single API call
-    codes_exchanges = [(s["stock_code"], s.get("exchange", "tse")) for s in watchlist]
-    loop = asyncio.get_running_loop()
-    prices = await loop.run_in_executor(None, fetch_watchlist_prices, codes_exchanges)
+        # Batch-fetch all prices in a single API call (executed off the event loop)
+        codes_exchanges = [(s["stock_code"], s.get("exchange", "tse")) for s in watchlist]
+        loop = asyncio.get_running_loop()
+        prices = await loop.run_in_executor(None, fetch_watchlist_prices, codes_exchanges)
 
-    for s in watchlist:
-        code = s["stock_code"]
-        name = s["stock_name"]
-        info = prices.get(code)
-        if not info:
-            continue
+        for s in watchlist:
+            code = s["stock_code"]
+            name = s["stock_name"]
+            info = prices.get(code)
+            if not info:
+                continue
 
-        for alert in check_alerts(code, name, info):
-            await channel.send(alert["message"], allowed_mentions=discord.AllowedMentions(everyone=True))
-
-        for alert in check_technical_alerts(code, name):
-            await channel.send(alert["message"], allowed_mentions=discord.AllowedMentions(everyone=True))
+            alerts = await loop.run_in_executor(
+                None, check_alerts, code, name, info
+            )
+            tech = await loop.run_in_executor(
+                None, check_technical_alerts, code, name, info["close"]
+            )
+            for alert in alerts + tech:
+                try:
+                    await channel.send(
+                        alert["message"],
+                        allowed_mentions=discord.AllowedMentions(everyone=True),
+                    )
+                except discord.HTTPException as e:
+                    log.warning("發送警報失敗 %s：%s", code, e)
+    except Exception:
+        log.exception("price_monitor 發生未預期錯誤（迴圈將繼續執行）")
 
 
 async def send_daily_report(title: str):
-    channel = client.get_channel(CHANNEL_ID)
+    channel = await _get_channel()
     if not channel:
         return
     watchlist = db.get_watchlist()
@@ -76,19 +127,37 @@ async def send_daily_report(title: str):
     await channel.send(embed=embed)
 
 
+def _report_slot_key(now: datetime) -> str:
+    return f"{now.date().isoformat()}@{now.strftime('%H:%M')}"
+
+
 # ── 定時報告 ─────────────────────────────────────────────
-@tasks.loop(seconds=60)
+@tasks.loop(seconds=30)
 async def scheduled_reports():
-    now = datetime.now()
+    """定時報告：以台北時間判斷檔位，且同一檔位一天只發一次。"""
+    global _sent_reports_date
+    now = now_taipei()
     if now.weekday() >= 5:
         return
+
+    if _sent_reports_date != now.date().isoformat():
+        _sent_reports.clear()
+        _sent_reports_date = now.date().isoformat()
+
     t = now.time()
-    if dtime(9, 5) <= t <= dtime(9, 6):
-        await send_daily_report("🌅 09:05 開盤報告")
-    elif dtime(12, 0) <= t <= dtime(12, 1):
-        await send_daily_report("☀️ 12:00 盤中報告")
-    elif dtime(13, 35) <= t <= dtime(13, 36):
-        await send_daily_report("🌆 13:35 收盤報告")
+    for (hh, mm), title in REPORT_SLOTS:
+        # 90 秒的容錯視窗；配合檔位去重，不會重複發送
+        start = t.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if start <= t <= start + timedelta(seconds=90):
+            key = _report_slot_key(now.replace(hour=hh, minute=mm))
+            if key in _sent_reports:
+                return
+            _sent_reports.add(key)
+            try:
+                await send_daily_report(title)
+            except Exception:
+                log.exception("定時報告發送失敗：%s", title)
+            return
 
 
 @client.event
@@ -96,9 +165,10 @@ async def on_ready():
     try:
         db.init_db()
         db.clear_today_alerts()
-        guild = discord.Object(id=GUILD_ID)
-        tree.copy_global_to(guild=guild)
-        await tree.sync(guild=guild)
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            tree.copy_global_to(guild=guild)
+            await tree.sync(guild=guild)
 
         watchlist = db.get_watchlist()
         if watchlist:
@@ -111,16 +181,18 @@ async def on_ready():
         if not scheduled_reports.is_running():
             scheduled_reports.start()
 
-        print(f"Bot 已啟動：{client.user}，監控 {len(watchlist)} 檔股票")
-        channel = client.get_channel(CHANNEL_ID)
-        if channel:
-            await channel.send(
-                f"@everyone ✅ 台股監控 Bot 已上線！監控中：{len(watchlist)} 檔股票",
-                allowed_mentions=discord.AllowedMentions(everyone=True),
-            )
-    except Exception as e:
-        import traceback
-        print(f"on_ready 錯誤：{e}\n{traceback.format_exc()}")
+        log.info("Bot 已啟動：%s，監控 %d 檔股票", client.user, len(watchlist))
+        # 上線通知只在初次啟動發送，重連（on_ready 可能觸發多次）不重複打擾
+        if not getattr(client, "_online_announced", False):
+            client._online_announced = True
+            channel = await _get_channel()
+            if channel:
+                await channel.send(
+                    f"@everyone ✅ 台股監控 Bot 已上線！監控中：{len(watchlist)} 檔股票",
+                    allowed_mentions=discord.AllowedMentions(everyone=True),
+                )
+    except Exception:
+        log.exception("on_ready 發生錯誤")
 
 
 # ── Slash Commands ────────────────────────────────────────
@@ -156,7 +228,7 @@ async def watch(interaction: discord.Interaction, codes: str):
 @app_commands.describe(code="股票代碼，例如 2330")
 async def unwatch(interaction: discord.Interaction, code: str):
     if db.is_watching(code):
-        info = get_stock_info(code)
+        info = await asyncio.get_running_loop().run_in_executor(None, get_stock_info, code)
         name = info["name"] if info else code
         db.remove_stock(code)
         await interaction.response.send_message(f"✅ 已移除監控：{name} ({code})")
@@ -184,18 +256,24 @@ async def status(interaction: discord.Interaction, code: str):
     if not info:
         await interaction.followup.send(f"❌ 查無股票代碼：{code}")
         return
-    embed = stock_status_embed(code, info)
+    embed = await loop.run_in_executor(None, stock_status_embed, code, info)
     await interaction.followup.send(embed=embed)
 
 
 @tree.command(name="target", description="設定目標價警報（漲至此價位時通知）")
 @app_commands.describe(code="股票代碼", price="目標價格")
 async def target(interaction: discord.Interaction, code: str, price: float):
+    await interaction.response.defer()
     loop = asyncio.get_running_loop()
     info = await loop.run_in_executor(None, get_stock_info, code)
-    name = info["name"] if info else code
+    if not info:
+        await interaction.followup.send(f"❌ 查無股票代碼：{code}")
+        return
+    name = info["name"]
+    if not db.is_watching(code):
+        db.add_stock(code, name, "tse")
     db.add_target(code, price)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"🎯 已設定 **{name} ({code})** 目標價：**{price:.2f}** 元"
     )
 
@@ -203,11 +281,17 @@ async def target(interaction: discord.Interaction, code: str, price: float):
 @tree.command(name="stoploss", description="設定停損價警報（跌至此價位時通知）")
 @app_commands.describe(code="股票代碼", price="停損價格")
 async def stoploss(interaction: discord.Interaction, code: str, price: float):
+    await interaction.response.defer()
     loop = asyncio.get_running_loop()
     info = await loop.run_in_executor(None, get_stock_info, code)
-    name = info["name"] if info else code
+    if not info:
+        await interaction.followup.send(f"❌ 查無股票代碼：{code}")
+        return
+    name = info["name"]
+    if not db.is_watching(code):
+        db.add_stock(code, name, "tse")
     db.add_stop_target(code, price)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"🛡️ 已設定 **{name} ({code})** 停損價：**{price:.2f}** 元\n（跌破時將發出 @everyone 警告）"
     )
 
@@ -284,17 +368,15 @@ async def holdings_cmd(interaction: discord.Interaction):
         await interaction.followup.send("📂 尚無持倉紀錄，用 `/hold` 新增。")
         return
     loop = asyncio.get_running_loop()
-    codes_exchanges = []
-    for h in held:
-        ex = "tse"
-        wl = db.get_watchlist()
-        match = next((s for s in wl if s["stock_code"] == h["stock_code"]), None)
-        if match:
-            ex = match.get("exchange", "tse")
-        codes_exchanges.append((h["stock_code"], ex))
+    wl = db.get_watchlist()
+    exchange_map = {s["stock_code"]: s.get("exchange", "tse") for s in wl}
+    codes_exchanges = [(h["stock_code"], exchange_map.get(h["stock_code"], "tse")) for h in held]
     prices = await loop.run_in_executor(None, fetch_watchlist_prices, codes_exchanges)
     embed = holdings_embed(held, prices)
     await interaction.followup.send(embed=embed)
 
 
-client.run(TOKEN)
+if __name__ == "__main__":
+    if not TOKEN:
+        raise SystemExit("缺少 DISCORD_TOKEN，請設定 .env")
+    client.run(TOKEN)

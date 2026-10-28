@@ -1,12 +1,6 @@
-from datetime import datetime, time as dtime
 from . import database as db
-from .twse_api import get_realtime_price
+from .market_time import is_silent_period, is_trading_time
 from .indicators import get_rsi, get_ma5, get_volume_ratio
-
-
-def is_silent_period() -> bool:
-    t = datetime.now().time()
-    return t >= dtime(13, 30) or t < dtime(9, 0)
 
 
 def check_alerts(code: str, name: str, info: dict) -> list[dict]:
@@ -73,7 +67,12 @@ def check_alerts(code: str, name: str, info: dict) -> list[dict]:
     return alerts
 
 
-def check_technical_alerts(code: str, name: str) -> list[dict]:
+def check_technical_alerts(code: str, name: str, price: float | None = None) -> list[dict]:
+    """
+    檢查技術面警報（RSI 超賣 / 跌破 5MA / 爆量）。
+    price: 由呼叫端傳入的即時價（MIS 批次查詢結果），
+    避免此函式再自行發一次網路請求造成限流。
+    """
     if is_silent_period():
         return []
 
@@ -89,7 +88,6 @@ def check_technical_alerts(code: str, name: str) -> list[dict]:
             })
 
     ma5 = get_ma5(code)
-    price = get_realtime_price(code)
     if ma5 and price and price < ma5:
         if not db.has_alerted_today(code, "below_ma5"):
             db.record_alert(code, "below_ma5")

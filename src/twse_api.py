@@ -1,10 +1,14 @@
 import requests
 import time
 import math
-from datetime import datetime, time as dtime
+
+from .market_time import is_trading_time, is_silent_period, now_taipei  # noqa: F401  (re-export)
 
 MIS_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 TWSE_DAY_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+
+# MIS 批次查詢每批最大檔數（避免 URL 過長被 API 拒絕）
+MIS_BATCH_SIZE = 30
 
 _MIS_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -17,14 +21,6 @@ MIS_TTL = 20  # seconds
 
 _code_exchange: dict[str, str] = {}   # code -> "tse" | "otc"
 _day_name_cache: dict[str, str] = {}  # code -> name (from STOCK_DAY_ALL)
-
-
-def is_trading_time() -> bool:
-    now = datetime.now()
-    if now.weekday() >= 5:
-        return False
-    t = now.time()
-    return dtime(9, 0) <= t <= dtime(13, 30)
 
 
 def _safe_float(s) -> float | None:
@@ -76,7 +72,7 @@ def fetch_watchlist_prices(codes_exchanges: list[tuple[str, str]]) -> dict[str, 
     """
     Batch-fetch real-time prices for the watchlist.
     codes_exchanges: list of (code, exchange).
-    Caches for MIS_TTL seconds.
+    Caches for MIS_TTL seconds; requests are chunked to avoid overly long URLs.
     """
     global _mis_cache, _mis_cache_ts
 
@@ -87,19 +83,26 @@ def fetch_watchlist_prices(codes_exchanges: list[tuple[str, str]]) -> dict[str, 
     if not codes_exchanges:
         return {}
 
-    ex_ch = "|".join(f"{ex}_{code}.tw" for code, ex in codes_exchanges)
-    try:
-        result = _query_mis(ex_ch)
+    result: dict[str, dict] = {}
+    # 分塊查詢，每批最多 MIS_BATCH_SIZE 檔
+    for i in range(0, len(codes_exchanges), MIS_BATCH_SIZE):
+        chunk = codes_exchanges[i:i + MIS_BATCH_SIZE]
+        ex_ch = "|".join(f"{ex}_{code}.tw" for code, ex in chunk)
+        try:
+            result.update(_query_mis(ex_ch))
+        except Exception:
+            continue
+
+    if result:
         _mis_cache = result
         _mis_cache_ts = now
         return result
-    except Exception:
-        return _mis_cache
+    return _mis_cache
 
 
 def get_stock_info(code: str, exchange: str | None = None) -> dict | None:
     """Get real-time info for a single stock. Falls back to yfinance if MIS unavailable."""
-    # Use cached batch result if fresh
+    # Use cached batch result if fresh（僅讀取，不寫入，避免汙染批次快取時間戳）
     now = time.time()
     if code in _mis_cache and now - _mis_cache_ts < MIS_TTL:
         return _mis_cache[code]
@@ -112,8 +115,6 @@ def get_stock_info(code: str, exchange: str | None = None) -> dict | None:
         try:
             result = _query_mis(f"{ex_try}_{code}.tw")
             if code in result:
-                _mis_cache[code] = result[code]
-                _mis_cache_ts = now
                 return result[code]
         except Exception:
             pass

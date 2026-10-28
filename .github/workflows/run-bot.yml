@@ -5,6 +5,11 @@ on:
   schedule:
     - cron: '0 */6 * * *'  # 每 6 小時自動重啟
 
+# 避免前一個 job 尚未結束時，兩個 bot 用同一 token 同時登入互相踢
+concurrency:
+  group: taiwan-stock-bot
+  cancel-in-progress: true
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -26,6 +31,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: pip
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -34,4 +40,6 @@ jobs:
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+          GUILD_ID: ${{ secrets.GUILD_ID }}
+          TZ: Asia/Taipei   # 保險起見同時設定系統時區；程式內部已用 Asia/Taipei 判斷
         run: python main.py

@@ -35,13 +35,16 @@
 taiwan-stock-bot/
 ├── main.py               # Bot 主體、Slash Commands、監控迴圈
 ├── src/
+│   ├── market_time.py    # 台北時區交易時段判斷（解決雲端 UTC 時區問題）
 │   ├── twse_api.py       # TWSE MIS 即時 API（上市）+ yfinance fallback
 │   ├── alert_engine.py   # 警報邏輯（漲跌停、目標價、停損、技術指標）
-│   ├── indicators.py     # RSI、MA5、MA20、量比、近期高低
+│   ├── indicators.py     # RSI、MA5、MA20、量比、近期高低（K 線 5 分鐘 TTL 快取）
 │   ├── database.py       # SQLite（監控清單、目標價、停損、警報記錄）
 │   └── formatters.py     # Discord Embed 格式化
+├── tests/
+│   └── test_bot.py       # 單元測試（不連網、不碰正式 DB）
 ├── data/
-│   └── stocks.db         # SQLite 資料庫（自動建立）
+│   └── stocks.db         # SQLite 資料庫（自動建立＋自動遷移）
 ├── .github/
 │   └── workflows/
 │       └── run-bot.yml   # GitHub Actions 雲端自動運行
@@ -73,6 +76,8 @@ cp .env.example .env
 ```env
 DISCORD_TOKEN=你的_Bot_Token
 DISCORD_CHANNEL_ID=要發送通知的頻道ID
+# 選填：Discord 伺服器 ID（加速 Slash 指令同步）
+GUILD_ID=你的伺服器ID
 ```
 
 > 頻道 ID 取得方式：Discord 開啟開發者模式（設定 → 進階），右鍵頻道 → 複製 ID
@@ -115,6 +120,14 @@ Bot 可免費部署在 GitHub Actions 上，每 6 小時自動重啟（Actions �
 | 歷史 K 線（RSI/MA）| [yfinance](https://github.com/ranaroussi/yfinance)（Yahoo Finance） |
 
 > 上櫃股票（OTC）同樣支援，Bot 新增時會自動識別交易所。
+
+## 測試
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+測試不發出真實網路請求，也不會觸碰正式資料庫（`data/stocks.db`）。
 
 ## 注意事項
 
