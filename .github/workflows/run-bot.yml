@@ -1,6 +1,10 @@
 name: Run Taiwan Stock Bot
 
 on:
+  push:
+    branches: [master]      # push 即重啟：新版碼立刻生效（md 文件變更不重啟）
+    paths-ignore:
+      - '**.md'
   workflow_dispatch:
   schedule:
     - cron: '0 */6 * * *'  # 每 6 小時自動重啟
