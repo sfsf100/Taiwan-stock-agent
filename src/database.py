@@ -82,6 +82,13 @@ def init_db():
                 )
         except sqlite3.OperationalError:
             pass
+        # Migrate: holdings 持倉防線門檻（可空 = 用模組預設值）
+        for col in ("loss_guard_pct", "trailing_guard_pct"):
+            try:
+                with conn:
+                    conn.execute(f"ALTER TABLE holdings ADD COLUMN {col} REAL")
+            except sqlite3.OperationalError:
+                pass
 
 
 # --- Watchlist ---
@@ -142,10 +149,16 @@ def get_stop_targets() -> list[dict]:
 
 # --- Holdings ---
 
-def add_holding(code: str, name: str, shares: int, cost_price: float):
+def add_holding(code: str, name: str, shares: int, cost_price: float,
+                loss_guard_pct: float | None = None,
+                trailing_guard_pct: float | None = None):
     _run(
-        "INSERT OR REPLACE INTO holdings (stock_code, stock_name, shares, cost_price, added_at) VALUES (?, ?, ?, ?, date('now'))",
-        (code, name, shares, cost_price)
+        """
+        INSERT OR REPLACE INTO holdings
+            (stock_code, stock_name, shares, cost_price, added_at, loss_guard_pct, trailing_guard_pct)
+        VALUES (?, ?, ?, ?, date('now'), ?, ?)
+        """,
+        (code, name, shares, cost_price, loss_guard_pct, trailing_guard_pct)
     )
 
 

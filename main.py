@@ -21,6 +21,7 @@ from src.formatters import (
 )
 from src.indicators import preload, get_rsi, get_ma5, get_ma20, get_recent_high_low
 from src.institutional import get_chips, chip_alerts, compute_streaks
+from src.portfolio_guard import check_position_guard, combo_chip_message
 
 load_dotenv()
 
@@ -89,6 +90,9 @@ async def price_monitor():
         loop = asyncio.get_running_loop()
         prices = await loop.run_in_executor(None, fetch_watchlist_prices, codes_exchanges)
 
+        # 持倉防線：一次取得所有持倉，逐檔檢查虧損／移動停損
+        hold_map = {h["stock_code"]: h for h in db.get_holdings()}
+
         for s in watchlist:
             code = s["stock_code"]
             name = s["stock_name"]
@@ -105,7 +109,11 @@ async def price_monitor():
             timing = await loop.run_in_executor(
                 None, check_buy_timing_alerts, code, name, info["close"]
             )
-            for alert in alerts + tech + timing:
+            holding = hold_map.get(code)
+            guard = await loop.run_in_executor(
+                None, check_position_guard, holding, info
+            ) if holding else []
+            for alert in alerts + tech + timing + guard:
                 try:
                     await channel.send(
                         alert["message"],
@@ -205,6 +213,12 @@ async def send_chip_report() -> bool:
         log.info("法人／融資資料尚未發布，跳過籌碼速報")
         return False
 
+    # 持倉 × 籌碼組合訊號需要即時價（MIS 盤後仍回最後成交價）
+    exchange_map = {s["stock_code"]: s.get("exchange", "tse") for s in watchlist}
+    codes_exchanges = [(c, exchange_map.get(c, "tse")) for c in codes]
+    prices = await loop.run_in_executor(None, fetch_watchlist_prices, codes_exchanges)
+    hold_map = {h["stock_code"]: h for h in db.get_holdings()}
+
     # 寫入每日快照（供之後計算「連續賣超 N 日」）
     rows = []
     for code, chip in chips.items():
@@ -231,6 +245,14 @@ async def send_chip_report() -> bool:
         streaks = compute_streaks(history)
         entries.append({"code": code, "chip": chip, "streaks": streaks})
         all_alert_msgs.extend(chip_alerts({**chip, "code": code}, streaks))
+
+        # 持倉 × 籌碼組合訊號
+        holding = hold_map.get(code)
+        if holding:
+            info = prices.get(code) or {}
+            combo = combo_chip_message(holding, info, chip.get("foreign_net"))
+            if combo:
+                all_alert_msgs.append(combo)
 
     if entries:
         embed = daily_chip_embed("📊 收盤籌碼速報（誰在賣？）", entries)
@@ -473,9 +495,22 @@ async def price_cmd(interaction: discord.Interaction, code: str):
         await interaction.followup.send(f"❌ 查無股票代碼：{code}")
 
 
-@tree.command(name="hold", description="記錄持有股票（永久儲存）")
-@app_commands.describe(code="股票代碼", shares="持有股數", cost="平均成本價")
-async def hold(interaction: discord.Interaction, code: str, shares: int, cost: float):
+@tree.command(name="hold", description="記錄持有股票（永久儲存），可選擇自訂防線門檻")
+@app_commands.describe(
+    code="股票代碼",
+    shares="持有股數",
+    cost="平均成本價",
+    loss_pct="虧損警報門檻%（正數表示虧損幅度，預設 8）",
+    trail_pct="移動停損門檻%（從持倉高點回撤幅度，預設 10）",
+)
+async def hold(
+    interaction: discord.Interaction,
+    code: str,
+    shares: int,
+    cost: float,
+    loss_pct: float | None = None,
+    trail_pct: float | None = None,
+):
     await interaction.response.defer()
     loop = asyncio.get_running_loop()
     name_from_db = None
@@ -487,9 +522,15 @@ async def hold(interaction: discord.Interaction, code: str, shares: int, cost: f
     if not name_from_db:
         await interaction.followup.send(f"❌ 查無股票代碼：{code}")
         return
-    db.add_holding(code, name_from_db, shares, cost)
+    # 門檻以正數儲存（使用者語意：虧損 X%／回撤 X%）
+    loss_val = loss_pct if (loss_pct is not None and loss_pct > 0) else None
+    trail_val = trail_pct if (trail_pct is not None and trail_pct > 0) else None
+    db.add_holding(code, name_from_db, shares, cost, loss_val, trail_val)
+    loss_note = f"　🩸 虧損警報 -{loss_val:.0f}%" if loss_val else ""
+    trail_note = f"　🔒 移動停損回撤 {trail_val:.0f}%" if trail_val else ""
     await interaction.followup.send(
         f"💼 已記錄持倉：**{name_from_db} ({code})**　{shares} 股　成本 {cost:.2f} 元"
+        f"{loss_note}{trail_note}"
     )
 
 

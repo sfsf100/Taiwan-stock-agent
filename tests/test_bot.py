@@ -309,7 +309,7 @@ class TestDatabase(unittest.TestCase):
         tables = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         conn.close()
-        for t in ("watchlist", "targets", "stop_targets", "alert_history", "holdings"):
+        for t in ("watchlist", "targets", "stop_targets", "alert_history", "holdings", "chip_daily"):
             self.assertIn(t, tables)
 
     def test_migrate_adds_exchange_column(self):
@@ -577,6 +577,79 @@ class TestChipFormatters(unittest.TestCase):
             {"code": "2330", "chip": self.CHIP, "streaks": {"foreign_sell_streak": 4}},
         ])
         self.assertIn("外資連賣 4 日", embed.fields[0].name.replace("*", ""))
+
+
+# ─────────────────────────────────────────────────────────────
+# portfolio_guard（持倉防線，不連網）
+# ─────────────────────────────────────────────────────────────
+class TestPortfolioGuard(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.tmp.name, "test.db")
+        import src.database as database
+        self.database = database
+        database.DB_PATH = self.db_path
+        database.init_db()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_loss_alert_triggers(self):
+        from src.portfolio_guard import check_position_guard
+        holding = {"stock_code": "2330", "stock_name": "台積電", "shares": 1000,
+                   "cost_price": 1000.0, "added_at": "2026-11-01"}
+        info = {"close": 900.0}
+        alerts = check_position_guard(holding, info)
+        self.assertTrue(any(a["type"] == "position_loss" for a in alerts))
+        self.assertIn("10.0%", alerts[0]["message"])  # 預設門檻 -8%，跌 10% 應觸發
+
+    def test_no_alert_when_profit(self):
+        from src.portfolio_guard import check_position_guard
+        holding = {"stock_code": "2330", "stock_name": "台積電", "shares": 1000,
+                   "cost_price": 900.0, "added_at": "2026-11-01"}
+        alerts = check_position_guard(holding, {"close": 950.0})
+        self.assertEqual(alerts, [])
+
+    def test_loss_alert_dedup_same_day(self):
+        from src.portfolio_guard import check_position_guard
+        holding = {"stock_code": "2330", "stock_name": "台積電", "shares": 1000,
+                   "cost_price": 1000.0, "added_at": "2026-11-01"}
+        first = check_position_guard(holding, {"close": 900.0})
+        self.assertEqual(len(first), 1)
+        second = check_position_guard(holding, {"close": 880.0})  # 仍未止損24小時
+        self.assertEqual(second, [])  # 同日去重
+
+    def test_loss_threshold_custom(self):
+        from src.portfolio_guard import check_position_guard
+        holding = {"stock_code": "2330", "stock_name": "台積電", "shares": 1000,
+                   "cost_price": 1000.0, "added_at": "2026-11-01", "loss_guard_pct": 15}
+        # -8% 不觸發（門檻 -15%），-16% 才觸發
+        self.assertEqual(check_position_guard(holding, {"close": 920.0}), [])
+        alerts = check_position_guard(holding, {"close": 840.0})
+        self.assertTrue(any(a["type"] == "position_loss" for a in alerts))
+
+    def test_trailing_protect(self):
+        from src import portfolio_guard
+        holding = {"stock_code": "2330", "stock_name": "台積電", "shares": 1000,
+                   "cost_price": 1000.0, "added_at": "2026-11-01"}
+        with patch.object(portfolio_guard, "_high_since_added", return_value=1100.0):
+            alerts = portfolio_guard.check_position_guard(holding, {"close": 950.0})
+        # 1000→1100 獲利，1100→950 回撤 13.6% ≥ 預設 10% → 觸發
+        self.assertTrue(any(a["type"] == "trailing_protect" for a in alerts))
+
+    def test_combo_chip_message(self):
+        from src.portfolio_guard import combo_chip_message
+        holding = {"stock_code": "2330", "stock_name": "台積電", "shares": 1000,
+                   "cost_price": 1000.0}
+        # 虧損 + 外資賣超
+        msg = combo_chip_message(holding, {"close": 900.0}, foreign_net=-11703)
+        self.assertIsNotNone(msg)
+        self.assertIn("雙重警告", msg)
+        self.assertIn("11,703", msg)
+        # 獲利中 → 不觸發
+        self.assertIsNone(combo_chip_message(holding, {"close": 1000.0}, foreign_net=-500))
+        # 外資買超 → 不觸發
+        self.assertIsNone(combo_chip_message(holding, {"close": 900.0}, foreign_net=500))
 
 
 if __name__ == "__main__":
