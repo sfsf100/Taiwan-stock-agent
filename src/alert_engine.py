@@ -1,6 +1,6 @@
 from . import database as db
-from .market_time import is_silent_period, is_trading_time
-from .indicators import get_rsi, get_ma5, get_volume_ratio
+from .market_time import is_silent_period, is_trading_time, now_taipei
+from .indicators import get_rsi, get_ma5, get_volume_ratio, get_recent_high_low
 
 
 def check_alerts(code: str, name: str, info: dict) -> list[dict]:
@@ -104,5 +104,57 @@ def check_technical_alerts(code: str, name: str, price: float | None = None) -> 
                 "type": "high_volume",
                 "message": f"@everyone 📢 **{name} ({code})** 異常量能\n今日成交量為均量的 **{vol_ratio:.1f}** 倍，注意主力動向",
             })
+
+    return alerts
+
+
+# 跌深門檻：自 20 日高點回撤超過此百分比發「跌深警示」
+DEEP_DRAWDOWN_PCT = -15.0
+# 量縮止跌門檻：回撤超過 -10% 且成交量縮至均量 70% 以下
+VOLUME_SHRINK_RATIO = 0.7
+# 量比必須在收盤前（12:30 後）才可信，早盤成交量必然偏低
+VOLUME_CHECK_TIME = (12, 30)
+
+
+def check_buy_timing_alerts(code: str, name: str, price: float) -> list[dict]:
+    """買盤時機警報：跌深警示＋量縮止跌初步訊號。
+
+    跌深 ≠ 止跌：訊息中明確提醒待法人止賣／量價確認再考慮承接。
+    """
+    if is_silent_period():
+        return []
+
+    alerts = []
+    high20, _low20 = get_recent_high_low(code)
+    if not high20 or high20 <= 0 or price <= 0:
+        return alerts
+    drawdown = (price - high20) / high20 * 100
+
+    if drawdown <= DEEP_DRAWDOWN_PCT and not db.has_alerted_today(code, "deep_drawdown"):
+        db.record_alert(code, "deep_drawdown")
+        alerts.append({
+            "type": "deep_drawdown",
+            "message": (
+                f"@everyone 💥 **【跌深警示】{name} ({code})**\n"
+                f"現價 {price:.2f}，自 20 日高點 {high20:.2f} 已回撤 **{abs(drawdown):.1f}%**。\n"
+                f"跌深 ≠ 止跌，急跌行情中建議先觀察法人止賣與量價止穩訊號，勿急著接刀。"
+            ),
+        })
+
+    # 收盤前量比不可靠，12:30 之後才評估「量縮止跌」
+    now = now_taipei()
+    if drawdown <= -10 and now.hour * 60 + now.minute >= VOLUME_CHECK_TIME[0] * 60 + VOLUME_CHECK_TIME[1]:
+        vol_ratio = get_volume_ratio(code)
+        if vol_ratio is not None and 0 < vol_ratio < VOLUME_SHRINK_RATIO:
+            if not db.has_alerted_today(code, "volume_shrink"):
+                db.record_alert(code, "volume_shrink")
+                alerts.append({
+                    "type": "volume_shrink",
+                    "message": (
+                        f"💧 **{name} ({code})** 量縮止跌初步訊號\n"
+                        f"股價已回撤 {abs(drawdown):.1f}%，今日成交量僅為 20 日均量的 {vol_ratio:.0%}，\n"
+                        f"若後續不再破底，可留意分批布局時機（需再確認法人端止賣）。"
+                    ),
+                })
 
     return alerts

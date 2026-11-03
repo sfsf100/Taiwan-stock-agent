@@ -188,3 +188,123 @@ def holdings_embed(holdings: list[dict], prices: dict) -> discord.Embed:
     total_pct = (total_pnl / total_cost * 100) if total_cost else 0
     embed.set_footer(text=f"總損益：{total_pnl:+.0f} 元 ({total_pct:+.1f}%)　總市值：{total_value:,.0f} 元")
     return embed
+
+
+def _lots_str(v: int | None) -> str:
+    """籌碼數值顯示：負數紅（賣超）、正數（買超），None → 沒有資料。"""
+    if v is None:
+        return "—"
+    return f"{v:+,}"
+
+
+def _chip_summary(chip: dict, streaks: dict, drawdown_pct: float | None, rsi: float | None) -> str:
+    """根據籌碼面＋跌深＋RSI 產生一句「現在該不該考慮買」的判讀。"""
+    notes: list[str] = []
+    foreign = chip.get("foreign_net")
+    total = chip.get("total_net")
+
+    if total is not None and foreign is not None:
+        sell_streak = streaks.get("foreign_sell_streak", 0)
+        if total < 0 and sell_streak >= 2:
+            notes.append(f"🚫 外資連續 {sell_streak} 日賣超，賣壓尚未止息，**接刀風險高**")
+        elif streaks.get("foreign_turned_buy"):
+            notes.append(f"✅ 外資由賣轉買（首日轉正），可開始留意，但建議等量價確認後再分批")
+        elif total > 0:
+            notes.append("✅ 法人買超，籌碼面相對正向")
+        else:
+            notes.append("⚠️ 法人賣超中，短線趨勢仍偏弱")
+
+    if drawdown_pct is not None:
+        if drawdown_pct <= -20:
+            notes.append(f"📉 自 20 日高點已回撤 **{abs(drawdown_pct):.1f}%**，進入急跌深區；跌深≠止跌")
+        elif drawdown_pct <= -10:
+            notes.append(f"📉 自 20 日高點回撤 {abs(drawdown_pct):.1f}%，留意止跌訊號")
+
+    if drawdown_pct is not None and drawdown_pct <= -10 and (rsi or 50) < 40:
+        notes.append("💡 跌深＋超賣並存：若法人止賣、量縮不再破底，才是較安全的分批時機")
+
+    return "\n".join(notes) if notes else "資料不足，暫無判讀"
+
+
+def chips_embed(
+    code: str,
+    chip: dict,
+    history: list[dict],
+    streaks: dict,
+    rsi: float | None = None,
+    price: float | None = None,
+    high20: float | None = None,
+) -> discord.Embed:
+    name = chip.get("name", code)
+    drawdown = None
+    if price and high20:
+        drawdown = (price - high20) / high20 * 100
+
+    color = 0x3498db if (chip.get("total_net") or 0) >= 0 else 0xe74c3c
+    embed = discord.Embed(title=f"🧮 籌碼面：{name} ({code})", color=color)
+    date_str = chip.get("date") or "未知"
+    embed.description = f"資料日期：{date_str}"
+
+    embed.add_field(name="外資", value=_lots_str(chip.get("foreign_net")), inline=True)
+    embed.add_field(name="投信", value=_lots_str(chip.get("trust_net")), inline=True)
+    embed.add_field(name="自營商", value=_lots_str(chip.get("dealer_net")), inline=True)
+    embed.add_field(name="三大法人合計", value=_lots_str(chip.get("total_net")), inline=True)
+    embed.add_field(name="融資增減", value=_lots_str(chip.get("margin_change")), inline=True)
+    if price:
+        embed.add_field(name="現價", value=f"{price:.2f}", inline=True)
+
+    if history:
+        recent = history[:5]
+        lines = []
+        for h in recent:
+            lines.append(f"{h['data_date']}　外資 {_lots_str(h.get('foreign_net'))}　投信 {_lots_str(h.get('trust_net'))}")
+        embed.add_field(name="近期法人動向（新→舊）", value="\n".join(lines), inline=False)
+
+    summary = _chip_summary(chip, streaks, drawdown, rsi)
+    embed.add_field(name="🧭 買盤時機判讀", value=summary, inline=False)
+
+    if rsi is not None:
+        embed.add_field(name="RSI(14)", value=f"{rsi:.1f}", inline=True)
+    if drawdown is not None:
+        embed.add_field(name="距20日高點", value=f"{drawdown:+.1f}%", inline=True)
+
+    embed.set_footer(text="⚠️ 籌碼資料由證交所/櫃買中心公開資訊彙整，僅供參考，非投資建議。")
+    return embed
+
+
+def daily_chip_embed(title: str, entries: list[dict]) -> discord.Embed:
+    """每日籌碼速報：監控清單整體法人動向一覽。
+
+    entries: [{"code", "chip", "streaks"}]
+    """
+    embed = discord.Embed(title=title, color=0x2c3e50)
+    if not entries:
+        embed.description = "今日尚無法人資料（可能未發布或非交易日）"
+        return embed
+    data_date = entries[0].get("chip", {}).get("date")
+    if data_date:
+        embed.description = f"資料日期：{data_date}"
+    for e in entries:
+        chip = e["chip"]
+        streaks = e.get("streaks", {})
+        code = e.get("code", "")
+        name = chip.get("name", code)
+        n_sell = streaks.get("foreign_sell_streak", 0) if streaks else 0
+        tag = ""
+        if n_sell >= 3:
+            tag = f" 🔴外資連賣 {n_sell} 日"
+        elif streaks.get("foreign_turned_buy") if streaks else False:
+            tag = " 🟢外資轉買"
+        total = chip.get("total_net")
+        embed.add_field(
+            name=f"{name} ({code}){tag}",
+            value=(
+                f"外資 {_lots_str(chip.get('foreign_net'))}　"
+                f"投信 {_lots_str(chip.get('trust_net'))}　"
+                f"合計 {_lots_str(total)}　"
+                f"融資 {_lots_str(chip.get('margin_change'))}"
+            ),
+            inline=False,
+        )
+    embed.set_footer(text="單位：張　⚠️ 僅供參考，非投資建議")
+    return embed

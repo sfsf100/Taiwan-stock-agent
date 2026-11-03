@@ -14,12 +14,13 @@ from src.twse_api import (
     get_stock_info, validate_stock, get_realtime_price,
     fetch_watchlist_prices,
 )
-from src.alert_engine import check_alerts, check_technical_alerts
+from src.alert_engine import check_alerts, check_technical_alerts, check_buy_timing_alerts
 from src.formatters import (
     stock_list_embed, stock_status_embed, daily_report_embed, recommend_embed,
-    holdings_embed,
+    holdings_embed, chips_embed, daily_chip_embed,
 )
 from src.indicators import preload, get_rsi, get_ma5, get_ma20, get_recent_high_low
+from src.institutional import get_chips, chip_alerts, compute_streaks
 
 load_dotenv()
 
@@ -101,7 +102,10 @@ async def price_monitor():
             tech = await loop.run_in_executor(
                 None, check_technical_alerts, code, name, info["close"]
             )
-            for alert in alerts + tech:
+            timing = await loop.run_in_executor(
+                None, check_buy_timing_alerts, code, name, info["close"]
+            )
+            for alert in alerts + tech + timing:
                 try:
                     await channel.send(
                         alert["message"],
@@ -173,6 +177,102 @@ async def scheduled_reports():
         log.exception("定時報告發送失敗：%s", title)
 
 
+# ── 每日籌碼速報（15:30 台北時間）───────────────────────────
+CHIP_REPORT_SLOT = (15, 30)
+_sent_chip_reports: set[str] = set()
+
+
+def _due_chip_report(now: datetime, window_sec: float = 120) -> bool:
+    hh, mm = CHIP_REPORT_SLOT
+    now_min = now.hour * 60 + now.minute + now.second / 60
+    slot_min = hh * 60 + mm
+    return slot_min <= now_min <= slot_min + window_sec / 60
+
+
+async def send_chip_report() -> bool:
+    """盤後法人資料出來後：寫入快照、發速報一覽與警報。回傳是否有發送。"""
+    channel = await _get_channel()
+    if not channel:
+        return False
+    watchlist = db.get_watchlist()
+    if not watchlist:
+        return False
+
+    loop = asyncio.get_running_loop()
+    codes = [s["stock_code"] for s in watchlist]
+    chips = await loop.run_in_executor(None, get_chips, codes)
+    if not chips:
+        log.info("法人／融資資料尚未發布，跳過籌碼速報")
+        return False
+
+    # 寫入每日快照（供之後計算「連續賣超 N 日」）
+    rows = []
+    for code, chip in chips.items():
+        rows.append({
+            "data_date": chip.get("date") or now_taipei().date().isoformat(),
+            "stock_code": code,
+            "stock_name": chip.get("name", ""),
+            "foreign_net": chip.get("foreign_net"),
+            "trust_net": chip.get("trust_net"),
+            "dealer_net": chip.get("dealer_net"),
+            "total_net": chip.get("total_net"),
+            "margin_change": chip.get("margin_change"),
+        })
+    await loop.run_in_executor(None, db.upsert_chip_daily, rows)
+
+    entries = []
+    all_alert_msgs: list[str] = []
+    for s in watchlist:
+        code = s["stock_code"]
+        chip = chips.get(code)
+        if not chip:
+            continue
+        history = db.get_chip_history(code, 10)
+        streaks = compute_streaks(history)
+        entries.append({"code": code, "chip": chip, "streaks": streaks})
+        all_alert_msgs.extend(chip_alerts({**chip, "code": code}, streaks))
+
+    if entries:
+        embed = daily_chip_embed("📊 收盤籌碼速報（誰在賣？）", entries)
+        try:
+            await channel.send(embed=embed)
+        except discord.HTTPException as e:
+            log.warning("籌碼速報發送失敗：%s", e)
+
+    for msg in all_alert_msgs:
+        try:
+            await channel.send(
+                f"@everyone {msg}",
+                allowed_mentions=discord.AllowedMentions(everyone=True),
+            )
+        except discord.HTTPException as e:
+            log.warning("籌碼警報發送失敗：%s", e)
+
+    return True
+
+
+@tasks.loop(seconds=60)
+async def chip_report():
+    """每日 15:30（台北時間、交易日）發送籌碼速報；一天只發一次。"""
+    now = now_taipei()
+    if now.weekday() >= 5:
+        return
+    if not _due_chip_report(now):
+        return
+    key = f"{now.date().isoformat()}@chip"
+    if key in _sent_chip_reports:
+        return
+    try:
+        sent = await send_chip_report()
+        if sent:
+            _sent_chip_reports.add(key)
+            # 清掉舊快照避免 DB 無限成長
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, db.clear_chip_history_before, now.date().isoformat())
+    except Exception:
+        log.exception("chip_report 發生未預期錯誤")
+
+
 @client.event
 async def on_ready():
     try:
@@ -193,6 +293,8 @@ async def on_ready():
             price_monitor.start()
         if not scheduled_reports.is_running():
             scheduled_reports.start()
+        if not chip_report.is_running():
+            chip_report.start()
 
         log.info("Bot 已啟動：%s，監控 %d 檔股票", client.user, len(watchlist))
         # 上線通知：不用 @everyone（GitHub Actions 每 6 小時重啟會重複觸發，
@@ -326,6 +428,36 @@ async def recommend(interaction: discord.Interaction, code: str):
     high20, low20 = await loop.run_in_executor(None, get_recent_high_low, code)
 
     embed = recommend_embed(code, info, rsi, ma5, ma20, high20, low20)
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="chips", description="查詢籌碼面：三大法人買賣超＋融資增減＋買盤時機判讀")
+@app_commands.describe(code="股票代碼，例如 2330")
+async def chips(interaction: discord.Interaction, code: str):
+    await interaction.response.defer()
+    loop = asyncio.get_running_loop()
+    code = code.strip()
+    info = await loop.run_in_executor(None, get_stock_info, code)
+    if not info:
+        await interaction.followup.send(f"❌ 查無股票代碼：{code}")
+        return
+
+    chip = (await loop.run_in_executor(None, get_chips, [code])).get(code)
+    if not chip:
+        await interaction.followup.send(
+            f"❌ 查無籌碼資料：{code}（可能為非上市／上櫃證券，或今日法人資料尚未發布）"
+        )
+        return
+
+    history = await loop.run_in_executor(None, db.get_chip_history, code, 10)
+    streaks = compute_streaks(history)
+    rsi = await loop.run_in_executor(None, get_rsi, code)
+    high20, _low = await loop.run_in_executor(None, get_recent_high_low, code)
+    price = info.get("close") or None
+
+    embed = await loop.run_in_executor(
+        None, chips_embed, code, chip, history, streaks, rsi, price, high20
+    )
     await interaction.followup.send(embed=embed)
 
 

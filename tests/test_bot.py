@@ -410,5 +410,174 @@ class TestFormatters(unittest.TestCase):
         self.assertIn("100000", embed.footer.text.replace(",", ""))
 
 
+# ─────────────────────────────────────────────────────────────
+# institutional（籌碼面解析與連續日數，純邏輯、不連網）
+# ─────────────────────────────────────────────────────────────
+class TestInstitutional(unittest.TestCase):
+    def test_to_int(self):
+        from src.institutional import _to_int
+        self.assertEqual(_to_int("23,482,462"), 23482462)
+        self.assertEqual(_to_int("-1,780,889"), -1780889)
+        self.assertIsNone(_to_int(""))
+        self.assertIsNone(_to_int("-"))
+        self.assertIsNone(_to_int(None))
+        self.assertIsNone(_to_int("abc"))
+        self.assertEqual(_to_int(" 12 "), 12)
+
+    def test_shares_to_lots(self):
+        from src.institutional import _shares_to_lots
+        self.assertEqual(_shares_to_lots("8,084,870"), 8085)  # 股 → 張，四捨五入
+        self.assertEqual(_shares_to_lots("-1,780,889"), -1781)
+        self.assertEqual(_shares_to_lots(""), 0)
+
+    def test_roc_to_ad(self):
+        from src.institutional import _roc_to_ad
+        self.assertEqual(_roc_to_ad("1151103"), "2026-11-03")
+        self.assertEqual(_roc_to_ad("1141231"), "2025-12-31")
+        self.assertEqual(_roc_to_ad("bad"), "bad")
+
+    def test_parse_t86(self):
+        from src.institutional import _parse_t86
+        payload = {
+            "date": "20261103",
+            "fields": [
+                "證券代號", "證券名稱",
+                "外陸資買進股數(不含外資自營商)", "外陸資賣出股數(不含外資自營商)",
+                "外陸資買賣超股數(不含外資自營商)", "投信買賣超股數",
+                "自營商買賣超股數", "三大法人買賣超股數",
+            ],
+            "data": [
+                ["2330", "台積電           ", "2,348,246", "15,397,592", "-13,049,346",
+                 "64,000", "-5,000", "-10,000"],
+                ["=-weighted average==="],
+            ],
+        }
+        result = _parse_t86(payload)
+        self.assertIn("2330", result)
+        row = result["2330"]
+        self.assertEqual(row["name"], "台積電")
+        self.assertEqual(row["date"], "2026-11-03")
+        self.assertEqual(row["foreign_net"], -13049)  # 張，四捨五入
+        self.assertEqual(row["trust_net"], 64)
+        self.assertEqual(row["dealer_net"], -5)
+        self.assertEqual(row["total_net"], -10)
+        self.assertNotIn("=", result)  # 權重平均列應被跳過
+
+    def test_parse_tpex_insti(self):
+        """TPEx 欄位名含亂空格，正規化比對應該抓得到值。"""
+        from src.institutional import _parse_tpex_insti
+        items = [
+            {
+                "Date": "1151103",
+                "SecuritiesCompanyCode": "7130",
+                "CompanyName": "台科股",
+                "ForeignInvestorsIncludeMainlandAreaInvestors-Difference": "500,000",   # 标準鍵
+                " Foreign Investors include Mainland Area Investors (Foreign Dealers excluded)-Difference": "-300",
+                "SecuritiesInvestmentTrustCompanies-Difference": "-100,000",
+                "Dealers-Difference": "200,000",
+                "TotalDifference": "600,000",
+            }
+        ]
+        result = _parse_tpex_insti(items)
+        row = result["7130"]
+        self.assertEqual(row["date"], "2026-11-03")
+        self.assertEqual(row["foreign_net"], 500)
+        self.assertEqual(row["trust_net"], -100)
+        self.assertEqual(row["dealer_net"], 200)
+        self.assertEqual(row["total_net"], 600)
+
+    def test_parse_tpex_insti_only_latest_date(self):
+        from src.institutional import _parse_tpex_insti
+        items = [
+            {"Date": "1151102", "SecuritiesCompanyCode": "AAA", "ForeignInvestorsIncludeMainlandAreaInvestors-Difference": "999999"},
+            {"Date": "1151103", "SecuritiesCompanyCode": "AAA", "ForeignInvestorsIncludeMainlandAreaInvestors-Difference": "1000"},
+        ]
+        result = _parse_tpex_insti(items)
+        self.assertEqual(result["AAA"]["foreign_net"], 1)
+        self.assertEqual(result["AAA"]["date"], "2026-11-03")
+
+    def test_compute_streaks(self):
+        from src.institutional import compute_streaks
+        history = [
+            {"foreign_net": -500, "trust_net": 100},   # 今天
+            {"foreign_net": -300, "trust_net": -100},
+            {"foreign_net": -100, "trust_net": 50},
+            {"foreign_net": 200, "trust_net": 0},     # 方向改變，停止累計
+        ]
+        s = compute_streaks(history)
+        self.assertEqual(s["foreign_sell_streak"], 3)
+        self.assertEqual(s["foreign_buy_streak"], 0)
+        self.assertEqual(s["trust_buy_streak"], 1)  # 只有今天買超，昨天轉負即停止
+        self.assertFalse(s["foreign_turned_buy"])
+
+    def test_compute_streaks_turned_buy(self):
+        from src.institutional import compute_streaks
+        history = [
+            {"foreign_net": 500, "trust_net": 0},   # 今天買超
+            {"foreign_net": -800, "trust_net": 0},  # 昨天賣超
+        ]
+        s = compute_streaks(history)
+        self.assertTrue(s["foreign_turned_buy"])
+        self.assertEqual(s["foreign_buy_streak"], 1)
+
+    def test_compute_streaks_trust_buy(self):
+        from src.institutional import compute_streaks
+        history = [
+            {"foreign_net": 0, "trust_net": 100},
+            {"foreign_net": 0, "trust_net": 50},
+            {"foreign_net": 0, "trust_net": 10},
+            {"foreign_net": 0, "trust_net": -5},
+        ]
+        s = compute_streaks(history)
+        self.assertEqual(s["trust_buy_streak"], 3)
+
+    def test_chip_alerts_big_sell(self):
+        from src.institutional import chip_alerts
+        chip = {"name": "台積電", "code": "2330", "foreign_net": -2500, "total_net": -2600}
+        msgs = chip_alerts(chip, {"foreign_sell_streak": 0, "trust_buy_streak": 0})
+        self.assertTrue(any("大額賣超" in m for m in msgs))
+
+    def test_chip_alerts_sell_streak(self):
+        from src.institutional import chip_alerts
+        chip = {"name": "台積電", "code": "2330", "foreign_net": -100, "total_net": -150}
+        msgs = chip_alerts(chip, {"foreign_sell_streak": 4, "trust_buy_streak": 0})
+        self.assertTrue(any("連續" in m and "賣超" in m for m in msgs))
+
+
+# ─────────────────────────────────────────────────────────────
+# formatters 籌碼面（缺資料時不可爆例外）
+# ─────────────────────────────────────────────────────────────
+class TestChipFormatters(unittest.TestCase):
+    CHIP = {
+        "name": "台積電", "date": "2026-11-03",
+        "foreign_net": -11703, "trust_net": 2346, "dealer_net": 2658,
+        "total_net": -6699, "margin_balance": 35219, "margin_change": 258,
+    }
+
+    def test_chips_embed_fields(self):
+        from src.formatters import chips_embed
+        embed = chips_embed(
+            "2330", self.CHIP,
+            history=[{"data_date": "2026-11-03", "foreign_net": -11703, "trust_net": 2346}],
+            streaks={"foreign_sell_streak": 1, "foreign_turned_buy": False},
+            rsi=28.5,
+        )
+        self.assertEqual(len(embed.fields) > 0, True)
+        self.assertIn("籌碼", embed.title)
+
+    def test_chips_embed_missing_values(self):
+        """缺融資／缺 RSI／空歷史都不可噴例外。"""
+        from src.formatters import chips_embed
+        embed = chips_embed("2330", {"name": "台積電", "foreign_net": None}, [], {})
+        self.assertIsNotNone(embed)
+
+    def test_daily_chip_embed_entry(self):
+        from src.formatters import daily_chip_embed
+        embed = daily_chip_embed("📊 收盤籌碼速報", [
+            {"code": "2330", "chip": self.CHIP, "streaks": {"foreign_sell_streak": 4}},
+        ])
+        self.assertIn("外資連賣 4 日", embed.fields[0].name.replace("*", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -60,6 +60,19 @@ def init_db():
                 );
                 CREATE INDEX IF NOT EXISTS idx_alert_history
                     ON alert_history (stock_code, alert_type, triggered_date);
+                CREATE TABLE IF NOT EXISTS chip_daily (
+                    data_date TEXT NOT NULL,
+                    stock_code TEXT NOT NULL,
+                    stock_name TEXT NOT NULL DEFAULT '',
+                    foreign_net INTEGER,
+                    trust_net INTEGER,
+                    dealer_net INTEGER,
+                    total_net INTEGER,
+                    margin_change INTEGER,
+                    PRIMARY KEY (data_date, stock_code)
+                );
+                CREATE INDEX IF NOT EXISTS idx_chip_daily
+                    ON chip_daily (stock_code, data_date);
             """)
         # Migrate: add exchange column to existing DBs
         try:
@@ -174,3 +187,41 @@ def record_alert(code: str, alert_type: str):
 def clear_today_alerts():
     """刪除非今日的警報紀錄（保留今日，避免重啟後重複通知）。"""
     _run("DELETE FROM alert_history WHERE triggered_date != ?", (_today(),))
+
+
+# --- Chip Flow (籌碼面每日快照) ---
+
+def upsert_chip_daily(rows: list[dict]):
+    """寫入/更新每日籌碼快照。rows 需含 data_date、stock_code。"""
+    for r in rows:
+        _run(
+            """
+            INSERT OR REPLACE INTO chip_daily
+                (data_date, stock_code, stock_name, foreign_net, trust_net, dealer_net, total_net, margin_change)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                r["data_date"],
+                r["stock_code"],
+                r.get("stock_name", ""),
+                r.get("foreign_net"),
+                r.get("trust_net"),
+                r.get("dealer_net"),
+                r.get("total_net"),
+                r.get("margin_change"),
+            ),
+        )
+
+
+def get_chip_history(code: str, days: int = 10) -> list[dict]:
+    """取得某股票最近 N 天的籌碼快照（新→舊排序）。"""
+    rows = _run(
+        "SELECT * FROM chip_daily WHERE stock_code = ? ORDER BY data_date DESC LIMIT ?",
+        (code, days),
+    )
+    return [dict(r) for r in rows]
+
+
+def clear_chip_history_before(date_iso: str):
+    """刪除指定日期之前的籌碼快照（避免資料庫無限增長）。"""
+    _run("DELETE FROM chip_daily WHERE data_date < ?", (date_iso,))
